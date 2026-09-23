@@ -72,6 +72,9 @@ pub struct LinuxPatchReviewState {
     /// Verified findings from the verification stage.
     pub findings: Vec<Value>,
 
+    /// Independent reachability checks, including rejected findings.
+    pub reachability_checks: Vec<Value>,
+
     /// Concise plain-text summary of the change generated at the end of review.
     pub summary: String,
     /// Generated LKML plain-text review from the report stage.
@@ -667,6 +670,12 @@ pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     wants_series_context: true,
 };
 
+pub static REACHABILITY: ConsolidationStage = ConsolidationStage {
+    name: "reachability",
+    short: "Reachability Check",
+    wants_series_context: false,
+};
+
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
@@ -676,8 +685,13 @@ pub static REPORT: ConsolidationStage = ConsolidationStage {
 /// In the order the workflow runs them. Each builder refers to its own
 /// definition above, so the name a stage registers under is the same string
 /// this list recognises and labels.
-pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
-    &[&DEDUPLICATION, &CONFLICT_RESOLUTION, &VERIFICATION, &REPORT];
+pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[
+    &DEDUPLICATION,
+    &CONFLICT_RESOLUTION,
+    &VERIFICATION,
+    &REACHABILITY,
+    &REPORT,
+];
 
 /// Marks where a stage's prompt carries the list of patches that follow this
 /// one in the series.
@@ -1150,6 +1164,14 @@ pub fn build_linux_patch_review_workflow_with_options(
             |s| s.findings.is_empty(),
             "No findings validated in verification stage",
         )
+        .executable_stage(Box::new(super::reachability::ReachabilityStage::new(
+            max_turns,
+            temperature,
+        )))
+        .early_exit_if(
+            |s| s.findings.is_empty(),
+            "No findings remaining after reachability checks",
+        )
         .stage(report_stage(max_turns, temperature))
         .build()
 }
@@ -1249,6 +1271,7 @@ mod tests {
             deduplication_stage(1, 1.0).name(),
             conflict_resolution_stage(1, 1.0).name(),
             verification_stage(1, 1.0).name(),
+            super::super::reachability::ReachabilityStage::new(1, 1.0).name(),
             report_stage(1, 1.0).name(),
         ] {
             assert!(is_known_stage(name), "{name} is not in any stage table");
@@ -1392,7 +1415,7 @@ mod tests {
     fn test_build_workflow_graph_structure() {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
-        assert_eq!(workflow.steps.len(), 10);
+        assert_eq!(workflow.steps.len(), 12);
     }
 
     #[test]

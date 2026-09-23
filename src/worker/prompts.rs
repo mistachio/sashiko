@@ -352,6 +352,7 @@ impl Worker {
             patch_concerns: Vec::new(),
             concerns: Vec::new(),
             findings: Vec::new(),
+            reachability_checks: Vec::new(),
             summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
@@ -771,6 +772,7 @@ mod tests {
                 "deduplication",
                 "conflict-resolution",
                 "verification",
+                "reachability",
                 "report"
             ]
         );
