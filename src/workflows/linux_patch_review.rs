@@ -274,7 +274,10 @@ pub const STAGE_REPORT_INSTRUCTION: &str = r#"# LKML-friendly report generation
 
 You are an automated review bot generating a report for the Linux Kernel Mailing List (LKML). Convert the provided JSON findings into a polite, standard, inline-commented LKML email reply.
 
-CRITICAL RULE: If a finding is flagged as pre-existing (`"preexisting": true`), you MUST explicitly state in your inline comment that this issue is pre-existing and was not introduced by the patch under review. Use phrasing like "This isn't a bug introduced by this patch, but..." or "This is a pre-existing issue, but..." to start the comment.
+CRITICAL RULE: Apply the applicable finding qualifier at the start of each inline comment:
+- If `"preexisting": true`, explicitly state that the issue already existed and was not introduced by this patch. Start with "This is a pre-existing issue, but...".
+- Otherwise, if `"currently_unreachable": true`, explicitly state that current in-tree paths cannot trigger the issue. Start with "Currently unreachable in-tree, but..." and use the supplied reachability evidence to explain the future extension or out-of-tree caller needed to trigger it. The severity describes the potential consequence if that condition becomes reachable.
+Add the applicable prefix when rendering the report; the finding's problem text need not contain it. Missing or false reachability attributes do not by themselves prove a currently reachable failure.
 
 Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
 
@@ -1097,12 +1100,39 @@ pub fn report_stage(max_turns: usize, temperature: f32) -> Stage<LinuxPatchRevie
 
 Findings:
 {{{{findings}}}}
+{{{{unreachable_context}}}}
 
 Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
                 serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+            })
+            .with_var("unreachable_context", |s: &LinuxPatchReviewState| {
+                let checks: Vec<_> = s
+                    .reachability_checks
+                    .iter()
+                    .filter(|check| {
+                        check["currently_unreachable"] == true
+                            && check["finding"]["preexisting"] != true
+                            && check["rejected"] == false
+                            && check["policy_filtered"] == false
+                    })
+                    .map(|check| {
+                        json!({
+                            "finding": check["finding"],
+                            "response": check["response"],
+                        })
+                    })
+                    .collect();
+                if checks.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\nReachability evidence for currently unreachable findings:\n{}\n",
+                        serde_json::to_string_pretty(&checks).unwrap_or_default()
+                    )
+                }
             }),
         )
         .output_format(OutputFormat::text_with_validator(

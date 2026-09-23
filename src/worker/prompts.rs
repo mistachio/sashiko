@@ -457,6 +457,7 @@ impl Worker {
         let final_output = json!({
             "summary": state.summary,
             "findings": state.findings,
+            "reachability_checks": state.reachability_checks,
             "dismissed_concerns": dismissed_concerns,
             "concerns": state.concerns,
             "review_inline": review_inline,

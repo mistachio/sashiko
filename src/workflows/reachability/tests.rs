@@ -5,7 +5,9 @@ use crate::ai::{
 use crate::toolbox::ToolBox;
 use crate::workflow::engine::WorkflowEngine;
 use crate::workflow::graph::WorkflowStep;
-use crate::workflows::linux_patch_review::build_linux_patch_review_workflow_with_options;
+use crate::workflows::linux_patch_review::{
+    build_linux_patch_review_workflow_with_options, report_stage,
+};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -500,6 +502,92 @@ async fn original_verification_precedes_audit_and_report_sees_only_survivors() {
 }
 
 #[tokio::test]
+async fn unreachable_findings_are_qualified_and_filtered_before_reporting() {
+    for (severities, retained_indices) in [
+        (["Low", "High", "Critical"], vec![1, 2]),
+        (["Medium", "high", "critical"], vec![1, 2]),
+        (["Low", "Medium", "Low"], vec![]),
+    ] {
+        let (dir, mut state) = fixture();
+        let mut original = findings();
+        for (finding, severity) in original.iter_mut().zip(severities) {
+            finding["severity"] = json!(severity);
+        }
+        let mut mock = Provider::new(state.target_commit_sha.clone());
+        mock.unreachable_all = true;
+        mock.verified_findings = original.clone();
+        let provider = Arc::new(mock);
+        let env = environment(dir.path(), provider.clone());
+        let mut workflow = build_linux_patch_review_workflow_with_options(5, 0.0);
+        let start = workflow
+            .steps
+            .iter()
+            .position(
+                |step| matches!(step, WorkflowStep::Stage(stage) if stage.name() == "verification"),
+            )
+            .unwrap();
+        workflow.steps.drain(..start);
+        state.findings.clear();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            WorkflowEngine::execute(&workflow, &env, &mut state, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(state.findings.len(), retained_indices.len());
+        for (finding, index) in state.findings.iter().zip(&retained_indices) {
+            assert_eq!(finding["currently_unreachable"], true);
+            for key in [
+                "problem",
+                "severity",
+                "severity_explanation",
+                "preexisting",
+                "locations",
+            ] {
+                assert_eq!(finding[key], original[*index][key]);
+            }
+        }
+        for (index, check) in state.reachability_checks.iter().enumerate() {
+            assert_eq!(check["finding"], original[index]);
+            assert_eq!(check["currently_unreachable"], true);
+            assert_eq!(
+                check["rejected"], false,
+                "reporting policy is not a technical refutation"
+            );
+            assert_eq!(check["policy_filtered"], !retained_indices.contains(&index));
+        }
+        let requests = provider.seen.lock().unwrap();
+        let reports: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.messages[0]
+                    .content
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("# LKML-friendly report generation")
+            })
+            .collect();
+        if retained_indices.is_empty() {
+            assert!(outcome.early_exit);
+            assert!(reports.is_empty());
+        } else {
+            assert_eq!(reports.len(), 1);
+            let prompt = reports[0].messages[0].content.as_deref().unwrap();
+            assert!(prompt.contains("Otherwise, if `\"currently_unreachable\": true`"));
+            assert!(prompt.contains("Reachability evidence for currently unreachable findings:"));
+            assert!(prompt.contains("Current driver.c callers supply flag=0"));
+            assert!(
+                !prompt.contains(MARKERS[0]),
+                "filtered findings must not reach the report"
+            );
+            assert!(prompt.contains("\"currently_unreachable\": true"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn preexisting_findings_are_audited_without_a_reachability_attribute() {
     for unreachable_all in [false, true] {
         let (dir, mut state) = fixture();
@@ -552,6 +640,53 @@ async fn preexisting_findings_are_audited_without_a_reachability_attribute() {
             assert_eq!(state.findings[1], original[2]);
         }
     }
+}
+
+#[tokio::test]
+async fn report_uses_only_retained_nonpreexisting_unreachable_evidence() {
+    let (dir, mut state) = fixture();
+    let original = state.findings.clone();
+    state.findings.truncate(1);
+    state.findings[0]["currently_unreachable"] = json!(true);
+    state.reachability_checks = original
+        .iter()
+        .enumerate()
+        .map(|(index, finding)| {
+            json!({
+                "finding": finding,
+                "currently_unreachable": true,
+                "rejected": index == 1,
+                "policy_filtered": index == 2,
+                "response": format!("Reachability evidence for {}", MARKERS[index]),
+            })
+        })
+        .collect();
+    let mut preexisting = original[0].clone();
+    preexisting["preexisting"] = json!(true);
+    preexisting["problem"] = json!("preexisting-finding");
+    state.findings.push(preexisting.clone());
+    // Old audit records may contain both attributes; do not report both qualifiers.
+    state.reachability_checks.push(json!({
+        "finding": preexisting,
+        "currently_unreachable": true,
+        "rejected": false,
+        "policy_filtered": false,
+        "response": "preexisting-audit-only",
+    }));
+    let provider = Arc::new(Provider::new(state.target_commit_sha.clone()));
+    let env = environment(dir.path(), provider.clone());
+    report_stage(5, 0.0)
+        .execute(&env, &mut state, None)
+        .await
+        .unwrap();
+    let requests = provider.seen.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let prompt = requests[0].messages[0].content.as_deref().unwrap();
+    assert!(prompt.contains("Reachability evidence for conditional-path"));
+    assert!(!prompt.contains(MARKERS[1]));
+    assert!(!prompt.contains(MARKERS[2]));
+    assert!(prompt.contains("preexisting-finding"));
+    assert!(!prompt.contains("preexisting-audit-only"));
 }
 
 #[tokio::test]
